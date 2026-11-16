@@ -31,7 +31,7 @@ Automates attendance on a KBTU university portal (default `pge.kbtu.kz`, overrid
 ```bash
 uv sync                                          # install deps into .venv
 uv run python main.py                            # run locally (needs env vars + reachable Selenium grid)
-uv run python -m compileall main.py app          # syntax check; no tests/linters are configured
+uv run pytest                                    # schedule, /schedule editor, commands, button filtering
 
 cp .env.example .env                             # required env vars before any run
 docker compose up --build -d                     # multi-arch image: same command on AMD64 and ARM64
@@ -47,11 +47,13 @@ Optional: `WSP_LOGIN`/`WSP_PASSWORD` (one-time seed for the state file — after
 ## Critical invariants
 
 - **State file is the source of truth** for credentials, base URL and schedule (`STATE_PATH`, `/data/state.json` in Docker, `bot-data` volume). `WSP_*`/`BASE_URL` env vars are one-time seeds consumed only when the state file is absent; `BASE_URL` has no code-level default.
-- **Threading model**: attendance loop in the main thread; telebot `infinity_polling` in a daemon thread (retries/reconnects owned by the library); command semantics live in `CommandProcessor` as pure logic. The `WebDriver` is owned exclusively by the attendance thread — command handlers must never touch it; they mutate `BotStore` and set the shared `wake` event.
+- **Threading model**: attendance loop in the main thread; telebot `infinity_polling` in a daemon thread (retries/reconnects owned by the library); command semantics live in `CommandProcessor` as pure logic. The `WebDriver` is owned exclusively by the attendance thread — command handlers must never touch it; they mutate `BotStore` and set the shared `wake` event. `/screen` sets a separate `screenshot` event that the attendance thread serves; `/status` reads only values the loop cached.
 - Attendance must not depend on Telegram: all notifications are best-effort, and command-poll failures back off and retry without affecting the loop.
 - The `/schedule` editor is stateless: every screen is fully encoded in `callback_data` (≤64 bytes) and re-rendered from the store — no sessions; buttons on old messages survive restarts. Mutations still go only through `BotStore.update_schedule`.
 - `app/config.py` evaluates `os.environ[...]` in the dataclass body, i.e. **at import time** (after `load_dotenv()` on module import). Required vars must exist before the process starts or import raises `KeyError`.
-- Portal selectors in `login_page.py`/`attendance.py` (`gwt-uid-*`, `v-button primary`, `v-label-bold`) are coupled to the portal's GWT/Vaadin DOM; `gwt-uid` numbering can change when the portal updates its UI. Selectors are the most likely breakage point — verify them against the live page before "fixing" logic.
+- Portal selectors in `login_page.py`/`attendance.py` (`gwt-uid-*`, `v-button primary`, `v-label-bold`) are coupled to the portal's GWT/Vaadin DOM; `gwt-uid` numbering can change when the portal updates its UI. Selectors are the most likely breakage point — verify them against the live page before "fixing" logic. The login form's «Вход» is itself a `v-button primary`: the login form is detected by its password field, and nothing is clicked as "attend" while that field is present. Login-page DOM last verified 2026-11-10; the logged-in attendance cards were not inspected (use `/screen`).
+- A click counts as attendance only when the number of clickable attend buttons drops and stays down once Vaadin is idle (`window.vaadin.clients[*].isActive()`). Logins back off 30 min after 3 consecutive failures to avoid locking the portal account.
+- The schedule editor's mutating buttons carry values (`sch:x:<t>:<HHMMHHMM>`, `sch:t:<t>:<0|1>`), never positions or flips. In the schedule model a missing `windows` key inherits the defaults; an explicit `[]` means no windows.
 - The process listens on no ports and never runs a browser itself; it only speaks WebDriver to `REMOTE_URL`.
 - Browser lifecycle is schedule-driven: the driver is closed when outside all windows / paused / credentials missing, and recreated when the next window opens. Keep that ownership inside `AttendanceService`.
 - Dependency versions are pinned in `pyproject.toml` + `uv.lock`; the image installs with `uv sync --frozen`. Keep lockfile in sync when touching deps.

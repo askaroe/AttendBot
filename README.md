@@ -58,15 +58,24 @@ Only messages from the configured `TG_CHAT_ID` are accepted. Changes take effect
 | --- | --- |
 | `/help` | List all commands |
 | `/status` | Account, mode, browser, schedule window, last attended lesson |
-| `/login <логин> <пароль>` | Set or change portal credentials |
-| `/url <адрес>` | Change the attendance page (e.g. `https://wsp.kbtu.kz/RegistrationOnline`) |
+| `/login <логин> <пароль>` | Set or change portal credentials (the bot deletes this message from the chat) |
+| `/url <адрес>` | Change the attendance page; only `https://` addresses on `kbtu.kz` (e.g. `https://wsp.kbtu.kz/RegistrationOnline`) |
+| `/screen` | Screenshot of what the bot's browser shows right now |
 | `/stop` | Pause attendance (browser closes; bot stays responsive) |
 | `/start` | Resume attendance |
 | `/schedule` | Open the schedule editor (inline buttons — see below) |
 
-**`/schedule` editor** — fully button-driven: main menu → day (Пн…Вс) or `⚙️ Default` → add/delete windows through an hour/minute grid, toggle days on/off, reset a day to defaults, pick the timezone from a paged list (curated page first). Screens live in one message (edited in place); buttons on old messages keep working after a restart. Overnight windows (`22:00-02:00`) are supported — pick an end time earlier than the start.
+**`/schedule` editor** — fully button-driven: main menu → day (Пн…Вс) or `⚙️ Default` → add/delete windows through an hour/minute grid, toggle days on/off, reset a day to defaults, pick the timezone from a paged list (curated page first). Screens live in one message (edited in place); buttons on old messages keep working after a restart and act on exactly the window or state they show. Windows are kept sorted; deleting a day's last window leaves that day without windows (use «Сбросить к default» to go back to the defaults). Overnight windows (`22:00-02:00`) are supported — pick an end time earlier than the start.
 
-The password is stored **in plain text** in the state file — consider deleting the `/login` message from the chat afterwards.
+The password is stored **in plain text** in the state file (mode 0600, in the `bot-data` volume).
+
+## How marking works
+
+While a schedule window is open the bot keeps the portal page open and checks for clickable attendance buttons about every 25–30 seconds (it waits up to 20 s for a button, reloads the page, pauses 5 s). Set the windows to your lesson times — outside them the browser is closed.
+
+* **✅ Отмечено** is sent only after the click visibly took effect (the button stopped being clickable).
+* **⚠️ …кнопка не изменилась** comes with a screenshot when a click had no effect; the bot keeps retrying.
+* **🔓 Вход выполнен** confirms the first successful login with new credentials. After 3 failed logins in a row the bot sends a screenshot and pauses logins for 30 minutes (or until the next `/login`), so the portal account is not locked.
 
 ---
 
@@ -99,7 +108,7 @@ Notes:
 | `BASE_URL`      | ✅             | `https://pge.kbtu.kz/RegistrationOnline` | Attendance page; **no default in code** — without it the bot idles until `/url` |
 | `WSP_LOGIN`     | ⛔️ (seed)     | `a_student`                              | Imported into state on first start only            |
 | `WSP_PASSWORD`  | ⛔️ (seed)     | `********`                               | Imported into state on first start only            |
-| `SELENIUM_IMAGE`| ⛔️ (defaults) | `selenium/standalone-chrome:latest`      | Grid image (multi-arch amd64+arm64)                |
+| `SELENIUM_IMAGE`| ⛔️ (defaults) | `selenium/standalone-chrome:4.52.0-20261101` | Grid image (multi-arch amd64+arm64), pinned    |
 | `SELENIUM_MEM_LIMIT`| ⛔️ (defaults) | `1g`                                 | Grid container memory ceiling (`512m`, `1.5g`…)   |
 | `REMOTE_URL`    | ⛔️ (defaults) | `http://selenium:4444/wd/hub`            | Internal service URL                               |
 | `STATE_PATH`    | ⛔️            | `/data/state.json` (in Docker)           | State file location                                |
@@ -117,3 +126,5 @@ Notes:
   `docker compose logs -f bot`
 * **Restart only the bot**
   `docker compose restart bot`
+* **Run the tests**
+  `uv run pytest`

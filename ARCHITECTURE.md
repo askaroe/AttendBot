@@ -44,14 +44,15 @@ flowchart LR
 
 ## Runtime flow
 
-1. Compose gates the bot on the Selenium `service_healthy` check (`/opt/bin/check-grid.sh`, shipped in the grid image) → the container runs `python /bot/main.py` (CMD, PID 1 → receives signals directly).
+1. Compose gates the bot on the Selenium `service_healthy` check (`/status` answers HTTP 200 — deliberately not the image's `check-grid.sh`, which reports unhealthy whenever the single browser slot is in use and would block bot restarts mid-window) → the container runs `python /bot/main.py` (CMD, PID 1 → receives signals directly).
 2. `main.py` builds `BotStore` (seed chain on first start: existing state file → `WSP_*`/`BASE_URL` env seeds → built-in default schedule; `BASE_URL` has no code-level default — the loop idles until it is set), sends a Telegram startup message, builds the `TeleBot` + `AttendanceService`, starts the telebot polling daemon thread, installs signal handlers.
-3. Attendance loop (poll 10 s, wait 30 s) — re-reads a `RuntimeState` snapshot **every iteration**:
+3. Attendance loop (poll 5 s, wait 20 s; one idle cycle ≈ 25–30 s) — re-reads a `RuntimeState` snapshot **every iteration**:
    - **Paused** (`/stop`) → close driver, wait for wake.
    - **No credentials** → close driver, wait for `/login`.
    - **Outside all windows** → close driver, interruptible sleep until the next window.
    - **Base URL changed** → recreate the driver against the new URL.
-   - **Inside a window** → ensure logged in → click attend → read lesson label → best-effort Telegram notify → sleep one poll.
+   - **Inside a window** → wait for the Vaadin UI to settle → log in if the password field is showing → click each clickable attend button (never while the login form is showing) → confirm the click (clickable-button count drops and stays down) → `✅` notify, or `⚠️` + screenshot (rate-limited) → sleep one poll. No button within 20 s → reload page.
+   - Pending `/screen` requests are served at the top of each iteration and while waiting for buttons.
    - All sleeps go through `Event.wait` on the shared `wake` event, so command mutations apply immediately, not after the current sleep.
 4. Command thread (telebot): receive update → authorize by chat id → text commands via `CommandProcessor.execute`; `/schedule` and `sch:*` callbacks via the stateless inline editor in `schedule_ui` (screens re-rendered in place with `edit_message_text`; mutations go through `update_schedule` and set `wake`).
 5. `SIGINT`/`SIGTERM` → Telegram stop message → `wake.set()` → `svc.shutdown()` (quit driver) → exit 0.
@@ -77,6 +78,9 @@ flowchart LR
 | Telegram bot init failure (e.g. malformed token) | Caught at startup → attendance continues without commands/notifications (logged) |
 | Command handler bug | Caught per update, error reply, polling continues |
 | Credentials missing | Loop idles with driver closed until `/login` |
+| Login fails (wrong password, portal error) | Retried each cycle; after 3 in a row → screenshot to Telegram, logins paused 30 min or until `/login` changes the credentials |
+| Click has no visible effect | `⚠️` + screenshot (once per lesson per 10 min); retried every cycle |
+| Unreadable state file | Moved aside as `state.json.bad-<timestamp>`, then fresh state from seeds |
 | `BASE_URL` missing (and not set via `/url`) | Loop idles with driver closed until it is set |
 | Fatal crash / exit | Telegram "Bot crashed" message, re-raise; container restarts via `restart: unless-stopped`; state survives in the volume |
 | Telegram send failure | Logged as warning; never propagates (notifications are best-effort) |
@@ -84,13 +88,13 @@ flowchart LR
 ## Trust boundaries
 
 - `bot → grid`: internal compose network only; the grid trusts anyone who can reach it — keep `REMOTE_URL` private, never expose ports.
-- `grid → portal`: WSP credentials are typed into the remote browser by the bot; they travel state file → grid → portal form. The state file contains the password in plain text (0600) — treat the volume accordingly.
-- `bot → Telegram`: bot token in env; only the configured `TG_CHAT_ID` may issue commands; `/login` messages remain in the chat history until the user deletes them.
+- `grid → portal`: WSP credentials are typed into the remote browser by the bot; they travel state file → grid → portal form. TLS certificates are verified, and `/url` only accepts `https://` hosts under `kbtu.kz`, so the password cannot be redirected to another site. The state file contains the password in plain text (0600) — treat the volume accordingly.
+- `bot → Telegram`: bot token in env; only the configured `TG_CHAT_ID` may issue commands; the bot deletes `/login` messages from the chat (falls back to asking the user if deletion fails).
 
 ## Deployment model
 
 - `Dockerfile`: `python3.12-bookworm-slim` + uv, `uv sync --frozen`, runs as `nobody`, stdout logging (`PYTHONUNBUFFERED=1`), no exposed ports, `/data` created and chowned for persistent state, `CMD` runs Python directly (PID 1 → receives signals).
-- `docker-compose.yml`: `bot` + a single `selenium` service (default `selenium/standalone-chrome:latest`, multi-arch amd64+arm64, overridable via `SELENIUM_IMAGE`), both `restart: unless-stopped`, default compose network — service names provide DNS (`http://selenium:4444`); the grid healthcheck gates the bot via `depends_on: condition: service_healthy`; `bot-data` volume mounted at `/data`.
+- `docker-compose.yml`: `bot` + a single `selenium` service (default pinned `selenium/standalone-chrome:4.52.0-20261101`, multi-arch amd64+arm64, overridable via `SELENIUM_IMAGE`), both `restart: unless-stopped`, json-file logs capped at 3×10 MB, default compose network — service names provide DNS (`http://selenium:4444`); the grid healthcheck gates the bot via `depends_on: condition: service_healthy`; `bot-data` volume mounted at `/data`.
 - Coolify compatibility contract: no compose profiles (unsupported by Coolify — coollabsio/coolify#6395); all configuration interpolates from environment variables (a local `.env` or the Coolify env UI — there is deliberately no service-level `env_file`, which would be absent on Coolify); required vars (`TG_BOT_TOKEN`, `TG_CHAT_ID`) use `${VAR:?…}` so Coolify blocks deployment until they are set; no exposed ports (worker + private grid); graceful SIGTERM; non-root; persistent state in a named volume.
 - Pointing `REMOTE_URL` at an external grid is supported, but the bundled `selenium` service still starts — remove it (and the `depends_on` block) in the Coolify compose editor if unwanted.
 
@@ -105,7 +109,7 @@ flowchart LR
 
 ## Known unknowns / limitations
 
-- Portal DOM selectors (`gwt-uid-4`/`gwt-uid-6`, `v-button primary`, `v-label-bold`) are fragile against portal UI updates; no self-test exists to detect breakage — the first symptom is Timeout loops. The `pge.kbtu.kz` default is unverified against the old `wsp` selectors.
-- No tests, linting, or CI.
+- Portal DOM selectors (`gwt-uid-4`/`gwt-uid-6`, `v-button primary`, `v-label-bold`) are fragile against portal UI updates; no self-test exists to detect breakage — the first symptom is Timeout loops or `⚠️` alerts. The `pge.kbtu.kz` login page was verified on 2026-11-10; the logged-in attendance cards were not (no credentials) — `/screen` shows them.
+- Unit tests (`uv run pytest`) cover the schedule model, the `/schedule` editor, command parsing and attend-button filtering; there is no linting or CI, and nothing tests against the live portal.
 - `Settings` snapshots env at import time; later env changes in-process are invisible.
 - Window granularity is minutes (inline editor uses a 5-minute grid); DST transitions rely on `zoneinfo` arithmetic and are untested.
