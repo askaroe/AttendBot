@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
@@ -61,6 +62,8 @@ class BotStore:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())  # never replace good state with an unflushed file
         os.replace(tmp, self._path)
 
     def _load(self) -> Dict[str, Any]:
@@ -74,6 +77,13 @@ class BotStore:
                 logger.error("State file %s is not a JSON object; starting fresh", self._path)
             except (json.JSONDecodeError, ValueError, OSError):
                 logger.exception("State file %s unreadable; starting fresh", self._path)
+            # Keep the bad file for manual recovery instead of overwriting it.
+            backup = f"{self._path}.bad-{time.strftime('%Y%m%d-%H%M%S')}"
+            try:
+                os.replace(self._path, backup)
+                logger.error("Moved unreadable state file to %s", backup)
+            except OSError:
+                logger.exception("Could not move unreadable state file aside")
 
         data: Dict[str, Any] = {
             "wsp_login": self._seed_login,

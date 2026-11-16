@@ -3,11 +3,10 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     StaleElementReferenceException,
     TimeoutException,
@@ -17,10 +16,15 @@ from selenium.common.exceptions import (
 from selenium.webdriver.remote.webdriver import WebDriver
 
 from ..telegram import TelegramNotifier
-from ..pages.login_page import LoginPage
+from ..pages.login_page import LoginPage, on_login_page, wait_vaadin_ready
 from ..store import RuntimeState
 
 logger = logging.getLogger(__name__)
+
+CONFIRM_SECS = 10                 # how long a click gets to visibly take effect
+UNCONFIRMED_NOTIFY_EVERY = 600    # at most one "click had no effect" alert per lesson per 10 min
+LOGIN_RETRY_LIMIT = 3             # consecutive failed logins before backing off …
+LOGIN_BACKOFF_SECS = 30 * 60      # … for this long, so the portal account is not locked
 
 
 class AttendanceService:
@@ -29,11 +33,11 @@ class AttendanceService:
     Re-reads RuntimeState (credentials, base URL, schedule, paused flag) every
     iteration, so Telegram commands take effect on the next tick — or
     immediately, because every sleep is interruptible via the shared wake
-    event. The WebDriver session is owned exclusively by this (main) thread.
+    event. The WebDriver session is owned exclusively by this (main) thread;
+    /screen reaches it only through the ``screenshot`` event.
     """
 
     ATTEND_BTN = (By.XPATH, "//div[contains(@class,'v-button') and contains(@class,'primary')]")
-    LESSON_LABEL = (By.XPATH, "//div[contains(@class,'v-label-bold') and contains(@class,'v-has-width')]")
 
     def __init__(
         self,
@@ -42,7 +46,8 @@ class AttendanceService:
         state_provider: Callable[[], RuntimeState],
         create_driver: Callable[[], WebDriver],
         wake: threading.Event,
-        wait_seconds: int = 30,
+        screenshot: Optional[threading.Event] = None,
+        wait_seconds: int = 20,
         driver: Optional[WebDriver] = None,
     ) -> None:
         self.driver: Optional[WebDriver] = driver
@@ -54,9 +59,16 @@ class AttendanceService:
         self._state_provider = state_provider
         self._create_driver = create_driver
         self._wake = wake
+        self._screenshot = screenshot
         self._driver_url: Optional[str] = None
+        self._current_url: Optional[str] = None  # cached for /status (other thread)
         self._last_lesson: Optional[str] = None
         self._last_attend_at: Optional[str] = None
+        self._unconfirmed_alerts: Dict[str, float] = {}
+        self._login_failures = 0
+        self._login_blocked: Optional[Tuple[str, str]] = None
+        self._login_blocked_until = 0.0
+        self._last_good_login: Optional[Tuple[str, str]] = None
 
         logger.info("AttendanceService initialized (wait_seconds=%s)", wait_seconds)
 
@@ -67,6 +79,31 @@ class AttendanceService:
             self.tg.send_message(text)
         except Exception:
             logger.warning("Failed to send Telegram notification")
+
+    def _send_screenshot(self, caption: str) -> None:
+        """Best-effort photo of the current page; falls back to text."""
+        png = None
+        if self.driver:
+            try:
+                png = self.driver.get_screenshot_as_png()
+            except WebDriverException:
+                logger.warning("Screenshot failed", exc_info=True)
+        if png is None:
+            self._notify(caption)
+            return
+        try:
+            self.tg.send_photo(png, caption)
+        except Exception:
+            logger.warning("Failed to send Telegram photo", exc_info=True)
+
+    def _serve_screenshot_request(self) -> None:
+        if not (self._screenshot and self._screenshot.is_set()):
+            return
+        self._screenshot.clear()
+        if not self.driver:
+            self._notify("📸 Браузер сейчас закрыт — вне окна расписания, на паузе или не задан /login.")
+            return
+        self._send_screenshot(f"📸 {self._safe_url()}")
 
     def _sleep(self, secs: float) -> None:
         """Interruptible sleep: returns early when a command mutated state."""
@@ -113,6 +150,7 @@ class AttendanceService:
             self.wait = None
             self.login_page = None
             self._driver_url = None
+            self._current_url = None
 
     def _safe_url(self) -> str:
         try:
@@ -122,14 +160,51 @@ class AttendanceService:
 
     # ---------- domain ----------
 
-    def ensure_logged_in(self, username: str, password: str) -> None:
+    def ensure_logged_in(self, username: str, password: str) -> bool:
+        """Log in if the login form is showing. False = not logged in (yet).
+
+        Repeated failures back off for LOGIN_BACKOFF_SECS (or until /login
+        changes the credentials) instead of retrying every few seconds, which
+        could lock the portal account.
+        """
         if not (self.driver and self.wait and self.login_page):
             raise RuntimeError("Driver is not initialized")
         logger.debug("Checking login state at %s", self._safe_url())
-        if self.login_page.at_login():
-            logger.info("Detected login screen → attempting login")
+        if not self.login_page.at_login():
+            return True
+
+        creds = (username, password)
+        if creds == self._login_blocked and time.monotonic() < self._login_blocked_until:
+            return False
+
+        logger.info("Detected login screen → attempting login")
+        try:
             self.login_page.login(username, password)
-            logger.info("Login submitted")
+            ok = self.login_page.wait_logged_in()
+        except TimeoutException:
+            ok = False
+
+        if ok:
+            logger.info("Login succeeded")
+            if creds != self._last_good_login:
+                self._notify(f"🔓 Вход в портал выполнен ({username}). Слежу за отметками.")
+            self._last_good_login = creds
+            self._login_failures = 0
+            self._login_blocked = None
+            return True
+
+        self._login_failures += 1
+        logger.warning("Login attempt failed (%d in a row)", self._login_failures)
+        if self._login_failures >= LOGIN_RETRY_LIMIT:
+            self._login_failures = 0
+            self._login_blocked = creds
+            self._login_blocked_until = time.monotonic() + LOGIN_BACKOFF_SECS
+            self._send_screenshot(
+                f"❌ Не удалось войти в портал {LOGIN_RETRY_LIMIT} раза подряд. "
+                f"Следующая попытка через {LOGIN_BACKOFF_SECS // 60} мин или сразу после "
+                "/login <логин> <пароль>."
+            )
+        return False
 
     def _clickable_attend_buttons(self) -> List:
         """All attend buttons that are actually clickable right now.
@@ -138,25 +213,35 @@ class AttendanceService:
         cards show a non-clickable button («Отмечен»), which must not block
         the rest. Vaadin buttons are divs — the native `disabled` attribute
         does not apply, so disabled state is detected via the v-disabled
-        class / aria-disabled attribute.
+        class / aria-disabled attribute. On the login form the primary button
+        is «Вход», so nothing there counts as an attend button.
         """
         if not self.driver:
             return []
         out: List = []
         try:
+            if on_login_page(self.driver):
+                return []
             for b in self.driver.find_elements(*self.ATTEND_BTN):
-                cls = b.get_attribute("class") or ""
-                if "v-disabled" in cls or b.get_attribute("aria-disabled") == "true":
-                    continue
                 try:
+                    cls = b.get_attribute("class") or ""
+                    if "v-disabled" in cls or b.get_attribute("aria-disabled") == "true":
+                        continue
                     if not b.is_displayed():
                         continue
                 except StaleElementReferenceException:
                     continue
                 out.append(b)
+        except InvalidSessionIdException:
+            raise
         except WebDriverException:
             return []
         return out
+
+    def _poll_buttons(self, _driver) -> List:
+        """WebDriverWait predicate; also serves /screen while waiting."""
+        self._serve_screenshot_request()
+        return self._clickable_attend_buttons() or False
 
     _TIME_LIKE = re.compile(r"\d{1,2}:\d{2}")
 
@@ -182,8 +267,30 @@ class AttendanceService:
             pass
         return ""
 
-    def try_attend_once(self) -> bool:
-        """Click EVERY currently clickable attend button (multi-card aware).
+    def _click_confirmed(self, before: int) -> bool:
+        """True once fewer attend buttons are clickable than before the click,
+        and that still holds after the page has settled."""
+        try:
+            WebDriverWait(self.driver, CONFIRM_SECS, poll_frequency=0.5).until(
+                lambda _d: len(self._clickable_attend_buttons()) < before
+            )
+        except TimeoutException:
+            return False
+        wait_vaadin_ready(self.driver, 5)
+        return len(self._clickable_attend_buttons()) < before
+
+    def _report_unconfirmed(self, title: str) -> None:
+        now = time.monotonic()
+        if now - self._unconfirmed_alerts.get(title, float("-inf")) < UNCONFIRMED_NOTIFY_EVERY:
+            return
+        self._unconfirmed_alerts[title] = now
+        self._send_screenshot(
+            f"⚠️ Нажал «отметиться» ({title}), но кнопка не изменилась. "
+            "Продолжаю пробовать — если не выйдет, отметьтесь вручную."
+        )
+
+    def try_attend_once(self) -> int:
+        """Click every clickable attend button; returns how many were confirmed.
 
         Raises TimeoutException when no clickable button appears within the
         wait window — i.e. everything is marked / no disciplines are open —
@@ -193,40 +300,53 @@ class AttendanceService:
             raise RuntimeError("Driver is not initialized")
 
         logger.debug("Waiting for ATTEND buttons…")
-        buttons = self.wait.until(lambda _d: self._clickable_attend_buttons() or False)
+        first = self.wait.until(self._poll_buttons)
 
-        attended_any = False
-        for btn in buttons:
+        confirmed = 0
+        failed: set = set()
+        # Re-scan after every click: Vaadin re-renders cards, so handles go stale.
+        for _ in range(len(first) + 2):
+            buttons = self._clickable_attend_buttons()
+            todo = [(b, self._lesson_title_for(b) or "без названия") for b in buttons]
+            todo = [(b, t) for b, t in todo if t not in failed]
+            if not todo:
+                break
+            btn, title = todo[0]
+            logger.info("Clicking ATTEND (%s) at %s", title, self._safe_url())
             try:
-                title = self._lesson_title_for(btn)
-                logger.info("Clicking ATTEND (%s) at %s", title or "?", self._safe_url())
                 btn.click()
-                attended_any = True
-                self._last_lesson = title or "<без названия>"
-                self._last_attend_at = datetime.now(self._state_provider().schedule.tz).strftime("%Y-%m-%d %H:%M")
-                if title:
-                    self._notify(f"Attended\n{title}")
-                time.sleep(1.5)  # let the card settle before the next one
             except StaleElementReferenceException:
-                logger.debug("Button went stale (page re-rendered); skipping")
+                logger.debug("Button went stale before the click; re-scanning")
                 continue
-        return attended_any
+            if self._click_confirmed(len(buttons)):
+                confirmed += 1
+                self._last_lesson = title
+                self._last_attend_at = datetime.now(self._state_provider().schedule.tz).strftime("%Y-%m-%d %H:%M")
+                self._unconfirmed_alerts.pop(title, None)
+                logger.info("Attendance confirmed: %s", title)
+                self._notify(f"✅ Отмечено: {title}")
+            else:
+                logger.warning("Click on ATTEND (%s) had no visible effect", title)
+                failed.add(title)
+                self._report_unconfirmed(title)
+        return confirmed
 
     def snapshot(self) -> Dict:
-        """Live view for /status (read by the command thread; benign races only)."""
+        """Live view for /status (read by the command thread; never touches the driver)."""
         return {
             "driver_open": self.driver is not None,
-            "current_url": self._safe_url(),
+            "current_url": self._current_url or "",
             "last_lesson": self._last_lesson,
             "last_attend_at": self._last_attend_at,
         }
 
     # ---------- main loop ----------
 
-    def run_loop(self, poll_secs: int = 10) -> None:
+    def run_loop(self, poll_secs: int = 5) -> None:
         logger.info("Starting schedule-aware loop (poll=%ss)", poll_secs)
 
         while True:
+            self._serve_screenshot_request()
             st = self._state_provider()
             now = datetime.now(st.schedule.tz)
 
@@ -274,10 +394,13 @@ class AttendanceService:
                     continue
 
             try:
-                self.ensure_logged_in(st.wsp_login, st.wsp_password)
-                self.try_attend_once()
-                logger.debug("Sleeping %ss (inside window)", poll_secs)
-                self._sleep(poll_secs)
+                if self.ensure_logged_in(st.wsp_login, st.wsp_password):
+                    self._current_url = self._safe_url()
+                    self.try_attend_once()
+                    logger.debug("Sleeping %ss (inside window)", poll_secs)
+                    self._sleep(poll_secs)
+                else:
+                    self._sleep(max(poll_secs, 30))
 
             except InvalidSessionIdException as e:
                 logger.exception("InvalidSessionIdException: %s; recreate driver", e)
@@ -287,7 +410,8 @@ class AttendanceService:
                 self._sleep(poll_secs)
 
             except TimeoutException:
-                logger.info("Timeout waiting for UI at %s; refreshing; next check in %ss", self._safe_url(), poll_secs)
+                # Normal idle state: nothing to mark right now. Reload to pick up new cards.
+                logger.debug("No open attendance at %s; refreshing; next check in %ss", self._safe_url(), poll_secs)
                 try:
                     if self.driver:
                         self.driver.refresh()

@@ -15,6 +15,7 @@ import logging
 import threading
 from datetime import datetime
 from typing import Callable, Dict, Optional
+from urllib.parse import urlsplit
 
 import telebot
 
@@ -31,10 +32,24 @@ HELP_TEXT = (
     "/url <адрес> — сменить страницу посещаемости\n"
     "/stop — приостановить отметки (браузер закроется)\n"
     "/start — возобновить отметки\n"
-    "/schedule — редактор расписания"
+    "/schedule — редактор расписания\n"
+    "/screen — скриншот того, что сейчас видит бот"
 )
 
 UNKNOWN_CMD_REPLY = "Неизвестная команда. /help — список команд."
+
+# /url may only point at the university portal: the bot types the stored WSP
+# password into whatever page it is sent to.
+ALLOWED_URL_DOMAIN = "kbtu.kz"
+
+
+def _allowed_url(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    return parts.scheme == "https" and (host == ALLOWED_URL_DOMAIN or host.endswith("." + ALLOWED_URL_DOMAIN))
 
 
 def _fmt_secs(s: int) -> str:
@@ -55,10 +70,12 @@ class CommandProcessor:
         store: BotStore,
         wake: threading.Event,
         status_provider: Callable[[], Dict],
+        screenshot: Optional[threading.Event] = None,
     ) -> None:
         self._store = store
         self._wake = wake
         self._status_provider = status_provider
+        self._screenshot = screenshot
         self._handlers: Dict[str, Callable[[str], str]] = {
             "/help": self._cmd_help,
             "/start": self._cmd_start,
@@ -68,6 +85,7 @@ class CommandProcessor:
             "/status": self._cmd_status,
             "/login": self._cmd_login,
             "/url": self._cmd_url,
+            "/screen": self._cmd_screen,
         }
 
     def execute(self, text: Optional[str]) -> Optional[str]:
@@ -138,8 +156,7 @@ class CommandProcessor:
         self._wake.set()
         return (
             f"✅ Учётные данные сохранены: {login}\n"
-            "⚠️ Пароль хранится в state-файле в открытом виде.\n"
-            "Совет: удалите сообщение с паролем из чата — он остаётся в истории."
+            "⚠️ Пароль хранится в state-файле в открытом виде."
         )
 
     def _cmd_url(self, text: str) -> str:
@@ -147,14 +164,32 @@ class CommandProcessor:
         if len(parts) != 2:
             return "Использование: /url https://…/RegistrationOnline"
         url = parts[1].strip()
-        if not url.startswith(("http://", "https://")):
-            return "URL должен начинаться с http:// или https://"
+        if not _allowed_url(url):
+            return f"Разрешены только адреса https://…{ALLOWED_URL_DOMAIN} (например https://pge.kbtu.kz/RegistrationOnline)"
         self._store.set_base_url(url)
         self._wake.set()
         return f"✅ Страница посещаемости: {url}"
 
+    def _cmd_screen(self, _text: str) -> str:
+        # The WebDriver belongs to the attendance thread: ask it, never touch it here.
+        if self._screenshot is None:
+            return "Скриншоты недоступны."
+        self._screenshot.set()
+        self._wake.set()
+        return "📸 Скриншот будет через несколько секунд."
 
-PROCESSOR_COMMANDS = ["help", "start", "resume", "stop", "pause", "status", "login", "url"]
+
+BOT_MENU = [
+    ("status", "состояние бота"),
+    ("screen", "скриншот того, что видит бот"),
+    ("schedule", "редактор расписания"),
+    ("login", "<логин> <пароль> — учётные данные"),
+    ("stop", "приостановить отметки"),
+    ("start", "возобновить отметки"),
+    ("help", "список команд"),
+]
+
+PROCESSOR_COMMANDS = ["help", "start", "resume", "stop", "pause", "status", "login", "url", "screen"]
 
 
 def create_telebot(
@@ -163,10 +198,11 @@ def create_telebot(
     store: BotStore,
     wake: threading.Event,
     status_provider: Callable[[], Dict],
+    screenshot: Optional[threading.Event] = None,
 ) -> telebot.TeleBot:
     """Build the TeleBot instance with command handlers registered."""
     bot = telebot.TeleBot(token)
-    processor = CommandProcessor(store, wake, status_provider)
+    processor = CommandProcessor(store, wake, status_provider, screenshot)
 
     def _authorized_chat(message) -> bool:
         if str(message.chat.id) == chat_id:
@@ -191,6 +227,16 @@ def create_telebot(
         if not _authorized_chat(message):
             return
         reply = processor.execute(message.text)
+        if (message.text or "").split(maxsplit=1)[0].split("@", 1)[0].lower() == "/login":
+            # Any /login message may carry a password: remove it from the chat
+            # history (bots may delete incoming messages in private chats).
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+                note = "🧹 Сообщение с паролем удалено из чата."
+            except Exception:
+                logger.warning("Could not delete /login message", exc_info=True)
+                note = "⚠️ Не удалось удалить сообщение с паролем — удалите его вручную."
+            reply = f"{reply}\n{note}" if reply else note
         if reply:
             _send(reply)
 
@@ -220,6 +266,13 @@ def create_telebot(
                 return
             logger.warning("edit_message_text failed; sending as new message", exc_info=True)
             _send(text, markup)
+
+    # Command menu shown when typing "/" (best effort; no exc_info — request
+    # errors can embed the bot token in the URL).
+    try:
+        bot.set_my_commands([telebot.types.BotCommand(c, d) for c, d in BOT_MENU])
+    except Exception as e:
+        logger.warning("Could not set the bot command menu: %s", type(e).__name__)
 
     # Fallback for recognized-but-unknown "/commands"; plain text is ignored.
     @bot.message_handler(func=lambda m: bool(m.text) and m.text.startswith("/"), content_types=["text"])

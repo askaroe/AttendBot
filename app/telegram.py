@@ -28,3 +28,9 @@ class TelegramNotifier:
             logger.warning("Telegram disabled (bot not initialized); dropping message")
             return
         self._bot.send_message(self.chat_id, text)
+
+    def send_photo(self, png: bytes, caption: str = "") -> None:
+        if self._bot is None:
+            logger.warning("Telegram disabled (bot not initialized); dropping photo")
+            return
+        self._bot.send_photo(self.chat_id, png, caption=caption[:1024] or None)

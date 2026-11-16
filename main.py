@@ -23,6 +23,9 @@ def main() -> int:
     st0 = store.snapshot()
 
     wake = threading.Event()
+    # /screen: the command thread sets it, the attendance thread (which owns
+    # the WebDriver) takes the screenshot.
+    screenshot = threading.Event()
     # Populated below; /status can only arrive after the polling thread starts,
     # i.e. after the service exists.
     service: list[AttendanceService] = []
@@ -35,6 +38,7 @@ def main() -> int:
             store=store,
             wake=wake,
             status_provider=lambda: service[0].snapshot() if service else {},
+            screenshot=screenshot,
         )
     except Exception:
         logging.exception(
@@ -67,7 +71,8 @@ def main() -> int:
         state_provider=store.snapshot,
         create_driver=lambda: make_driver(settings.remote_url),
         wake=wake,
-        wait_seconds=30,
+        screenshot=screenshot,
+        wait_seconds=20,
     )
     service.append(svc)
 
@@ -100,7 +105,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _graceful_shutdown)
 
     try:
-        svc.run_loop(poll_secs=10)
+        svc.run_loop(poll_secs=5)
     except Exception as e:
         safe_notify(
             "💥 Bot crashed\n"
