@@ -7,12 +7,21 @@
 # No compose profiles on purpose: Coolify does not support them
 # (https://github.com/coollabsio/coolify/issues/6395).
 
+# Bounded container logs (Docker's json-file default grows without limit).
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   selenium:
     # Multi-arch image (amd64 + arm64) — works on both Intel/AMD and ARM hosts.
-    # Override to use an alternative grid image, e.g. seleniarm/standalone-chromium:latest
-    image: ${SELENIUM_IMAGE:-selenium/standalone-chrome:latest}
+    # Pinned (grid 4.52.0 / Chrome 157) so a redeploy never pulls a surprise
+    # browser; bump deliberately. Override via SELENIUM_IMAGE if needed.
+    image: ${SELENIUM_IMAGE:-selenium/standalone-chrome:4.52.0-20261101}
     restart: unless-stopped
+    logging: *logging
     # Chrome runs with --disable-dev-shm-usage (falls back to /tmp), so a big
     # /dev/shm is not needed; XvFB is off because the browser is headless.
     shm_size: 256m
@@ -20,8 +29,11 @@ services:
     environment:
       - SE_START_XVFB=false
     healthcheck:
-      # Health-check tool shipped inside the image (SeleniumHQ/docker-selenium)
-      test: ["CMD", "/opt/bin/check-grid.sh", "--host", "0.0.0.0", "--port", "4444"]
+      # "Grid process answers", not the image's check-grid.sh: that one wants
+      # /status .value.ready == true, which turns false while the bot holds the
+      # only browser slot — the grid then goes unhealthy mid-window and compose
+      # refuses to (re)start the bot. /status returns 200 either way.
+      test: ["CMD-SHELL", "curl -sf --noproxy '*' -o /dev/null http://localhost:4444/status || exit 1"]
       interval: 10s
       timeout: 10s
       retries: 18
@@ -32,6 +44,7 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    logging: *logging
     # No ports on purpose: the bot is a worker, and the grid must stay on the
     # internal compose network — anyone who can reach it can drive the browser.
     environment:
