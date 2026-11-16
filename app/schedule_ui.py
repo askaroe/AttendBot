@@ -6,12 +6,16 @@ re-rendered from the store on every click — no sessions to expire, and
 buttons on old messages keep working after a restart. Mutations go through
 ``BotStore.update_schedule`` (validate-then-commit, lock-protected).
 
+Mutating buttons carry the target value, not a position or a "flip": an old
+❌ button deletes exactly the window it shows (or nothing), and an old
+on/off button sets the state its label promised.
+
 Callback grammar ("t" = target: 0..6 weekday, 7 = default windows):
   sch:m                        main menu
   sch:d:<t>                    day/defaults menu
-  sch:t:<t>                    toggle day on/off (t < 7)
+  sch:t:<t>:<0|1>              switch day off/on (t < 7)
   sch:c:<t>                    reset day to default windows (t < 7)
-  sch:x:<t>:<i>                delete window i of target t
+  sch:x:<t>:<HHMMHHMM>         delete that window of target t
   sch:w:<t>:sh[:<H>]           add-window wizard: start hour / start minute
   sch:w:<t>:sm:<H>:<M>         end-hour grid
   sch:w:<t>:eh:<H>:<M>:<h>     end-minute grid
@@ -29,7 +33,7 @@ from zoneinfo import ZoneInfo, available_timezones
 
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from .schedule import WEEKDAY_ORDER
+from .schedule import WEEKDAY_ORDER, format_window, parse_windows
 from .store import BotStore
 
 logger = logging.getLogger(__name__)
@@ -65,6 +69,25 @@ def _entry(data: Dict, t: int) -> Dict:
     if t == DEFAULTS_TARGET:
         return data.setdefault("defaults", {})
     return data.setdefault("weekdays", {}).setdefault(WEEKDAY_ORDER[t], {})
+
+
+def _canonical(window: str) -> str:
+    """'9:00 - 10:00' → '09:00-10:00' (raises ValueError when malformed)."""
+    return format_window(parse_windows([window])[0])
+
+
+def _window_from_token(token: str) -> str:
+    """'09001000' → '09:00-10:00' (callback-data form; ':' is the separator)."""
+    if len(token) != 8 or not token.isdigit():
+        raise ValueError(f"bad window token {token!r}")
+    return _canonical(f"{token[0:2]}:{token[2:4]}-{token[4:6]}:{token[6:8]}")
+
+
+def _target(tok: List[str], *, allow_defaults: bool) -> int:
+    t = int(tok[2])
+    if not 0 <= t <= (DEFAULTS_TARGET if allow_defaults else DEFAULTS_TARGET - 1):
+        raise ValueError(f"bad schedule target {t}")
+    return t
 
 
 def _effective_windows(data: Dict, t: int) -> List[str]:
@@ -126,11 +149,11 @@ def day_screen(store: BotStore, t: int, note: str = "") -> Screen:
     if t != DEFAULTS_TARGET:
         enabled = st.schedule.days[t].enabled
         rows.append([
-            _btn("⏸ Выключить день" if enabled else "✅ Включить день", f"sch:t:{t}"),
+            _btn("⏸ Выключить день" if enabled else "✅ Включить день", f"sch:t:{t}:{0 if enabled else 1}"),
             _btn("🗑 Сбросить к default", f"sch:c:{t}"),
         ])
-    for i, (a, b) in enumerate(windows):
-        rows.append([_btn(f"❌ {a:%H:%M}-{b:%H:%M}", f"sch:x:{t}:{i}")])
+    for a, b in windows:
+        rows.append([_btn(f"❌ {a:%H:%M}-{b:%H:%M}", f"sch:x:{t}:{a:%H%M}{b:%H%M}")])
     rows.append([_btn("➕ Добавить окно", f"sch:w:{t}:sh")])
     rows.append([_btn("◀️ Назад", "sch:m")])
     return "\n".join(lines), _kb(rows)
@@ -187,21 +210,21 @@ def _dispatch(tok: List[str], store: BotStore, wake: threading.Event) -> Optiona
         return menu_screen(store)
 
     if kind == "d":
-        return day_screen(store, int(tok[2]))
+        return day_screen(store, _target(tok, allow_defaults=True))
 
     if kind == "t":
-        t = int(tok[2])
-        enabled = store.snapshot().schedule.days[t].enabled
+        t = _target(tok, allow_defaults=False)
+        enabled = tok[3] == "1"
 
-        def toggle(d: Dict) -> None:
-            _entry(d, t)["enabled"] = not enabled
+        def set_enabled(d: Dict) -> None:
+            _entry(d, t)["enabled"] = enabled
 
-        store.update_schedule(toggle)
+        store.update_schedule(set_enabled)
         wake.set()
         return day_screen(store, t)
 
     if kind == "c":
-        t = int(tok[2])
+        t = _target(tok, allow_defaults=False)
 
         def clear(d: Dict) -> None:
             d.setdefault("weekdays", {}).pop(WEEKDAY_ORDER[t], None)
@@ -211,19 +234,22 @@ def _dispatch(tok: List[str], store: BotStore, wake: threading.Event) -> Optiona
         return day_screen(store, t)
 
     if kind == "x":
-        t, i = int(tok[2]), int(tok[3])
+        t = _target(tok, allow_defaults=True)
+        window = _window_from_token(tok[3])
+        found = []
 
         def delete(d: Dict) -> None:
             ws = _effective_windows(d, t)
-            del ws[i]
-            _entry(d, t)["windows"] = ws
+            keep = [w for w in ws if _canonical(w) != window]
+            found.append(len(keep) != len(ws))
+            _entry(d, t)["windows"] = keep
 
         store.update_schedule(delete)
         wake.set()
-        return day_screen(store, t)
+        return day_screen(store, t, "" if found[0] else f"ℹ️ Окна {window} уже нет")
 
     if kind == "w":
-        t = int(tok[2])
+        t = _target(tok, allow_defaults=True)
         stage = tok[3]
         if stage == "sh":
             if len(tok) == 4:
@@ -238,15 +264,17 @@ def _dispatch(tok: List[str], store: BotStore, wake: threading.Event) -> Optiona
             return _wizard_screen(f"➕ {H:02d}:{M:02d} — {h:02d}:__ минуты конца", _grid(f"sch:w:{t}:em:{H}:{M}:{h}", range(0, 60, MINUTES_STEP)), t)
         if stage == "em":
             H, M, h, m = int(tok[4]), int(tok[5]), int(tok[6]), int(tok[7])
-            window = f"{H:02d}:{M:02d}-{h:02d}:{m:02d}"
+            window = _canonical(f"{H:02d}:{M:02d}-{h:02d}:{m:02d}")
+            if (h, m) == (H, M):
+                return day_screen(store, t, "❌ Начало и конец совпадают — окно не добавлено")
             note = ""
-            if (h, m) <= (H, M):
+            if (h, m) < (H, M):
                 note = "ℹ️ Окно переходит через полночь"
 
             def add(d: Dict) -> None:
-                ws = _effective_windows(d, t)
-                ws.append(window)
-                _entry(d, t)["windows"] = ws
+                ws = {_canonical(w) for w in _effective_windows(d, t)}
+                ws.add(window)
+                _entry(d, t)["windows"] = sorted(ws)  # "HH:MM-…" sorts by start
 
             store.update_schedule(add)
             wake.set()

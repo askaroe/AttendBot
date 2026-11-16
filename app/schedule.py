@@ -76,7 +76,10 @@ class Schedule:
         for idx, name in enumerate(WEEKDAY_ORDER):
             d = wd.get(name, {}) or {}
             enabled = bool(d.get("enabled", True))
-            windows = parse_windows(d.get("windows")) or default_windows
+            # A missing 'windows' key means "use the defaults"; an explicit
+            # empty list means "no windows" (e.g. the last one was deleted).
+            raw = d.get("windows")
+            windows = default_windows if raw is None else parse_windows(raw)
             days[idx] = DayRule(enabled=enabled, windows=windows)
 
         return cls(tz=tz, default_windows=default_windows, days=days)
@@ -128,9 +131,14 @@ class Schedule:
         return False
 
     def seconds_until_next_open(self, dt: datetime) -> int:
-        """Seconds until the next time we are inside an open window. 0 if already open."""
+        """Seconds until the next time we are inside an open window. 0 if already open.
+
+        Considers every window (they are stored in insertion order, not sorted),
+        so an earlier window listed after a later one is never skipped.
+        """
         dt = dt.astimezone(self.tz)
 
+        best: Optional[float] = None
         for day_offset in range(-1, 8):  # yesterday's overnight window … one week ahead
             cur = dt + timedelta(days=day_offset)
             rule = self.days[cur.weekday()]
@@ -138,17 +146,26 @@ class Schedule:
                 continue
             for start_t, end_t in rule.windows:
                 start_dt, end_dt = self._window_bounds(cur, start_t, end_t)
-                if dt < end_dt:
-                    if dt < start_dt:
-                        return max(0, int((start_dt - dt).total_seconds()))
+                if dt >= end_dt:
+                    continue
+                if dt >= start_dt:
                     return 0
+                wait = (start_dt - dt).total_seconds()
+                if best is None or wait < best:
+                    best = wait
 
-        # Fallback — shouldn't happen with weekly coverage; wake in 1 hour.
-        return 3600
+        if best is None:
+            # No enabled windows at all; re-check in an hour.
+            return 3600
+        return max(0, int(best))
 
     def seconds_until_close(self, dt: datetime) -> Optional[int]:
-        """Seconds until the currently open window ends. None if not inside any window."""
+        """Seconds until the currently open window ends. None if not inside any window.
+
+        With overlapping windows, reports the latest end among those containing dt.
+        """
         dt = dt.astimezone(self.tz)
+        best: Optional[int] = None
         for day_offset in (0, -1):
             cur = dt + timedelta(days=day_offset)
             rule = self.days[cur.weekday()]
@@ -157,8 +174,9 @@ class Schedule:
             for start_t, end_t in rule.windows:
                 start_dt, end_dt = self._window_bounds(cur, start_t, end_t)
                 if start_dt <= dt < end_dt:
-                    return int((end_dt - dt).total_seconds())
-        return None
+                    left = int((end_dt - dt).total_seconds())
+                    best = left if best is None else max(best, left)
+        return best
 
     # ---- Presentation ----
 
@@ -170,5 +188,5 @@ class Schedule:
                 lines.append(f"• {names[idx]}: off")
                 continue
             windows = ", ".join(format_window(w) for w in rule.windows)
-            lines.append(f"• {names[idx]}: {windows or 'default'}")
+            lines.append(f"• {names[idx]}: {windows or '—'}")
         return "\n".join(lines)
